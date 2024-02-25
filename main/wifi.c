@@ -21,6 +21,52 @@ int8_t wifi_connect(char* ssid, char* password)
     return rval;
 }
 
+void wifi_deauth_attack(uint8_t channel)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_ap();
+    wifi_init_config_t wifi_config = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&wifi_config);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    esp_wifi_set_mode(WIFI_MODE_AP);
+
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "No_WiFi_Here",
+            .ssid_len = 12,
+            .password = "1337",
+            .channel = channel,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .ssid_hidden = 0,
+            .max_connection = 4,
+            .beacon_interval = 60000
+        }
+    };
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_start();
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    xTaskCreate(&_deauth_task, "deauth_task", 2048, NULL, 5, NULL);
+
+
+}
+
+void _deauth_task(void *param)
+{
+    const MacAddress target = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }; // Broadcast Mac Address
+    const MacAddress ap     = { 0XD0, 0XF9, 0X9B, 0X4E, 0XAD, 0X2A }; // Multiplay_AD2A
+
+    while(1) {
+        vTaskDelay( 1000 / portTICK_PERIOD_MS );
+        for(uint8_t ch = 1; ch < 11; ch++) {
+            printf("Deauthing channel %d\n", ch);
+            esp_err_t res;
+            _wifi_send_deauth_packet(target, ap, ch);
+        }
+    }
+}
+
 void _init_wifi_driver()
 {
     ESP_LOGI(TAG, "Initializing driver...");
@@ -39,8 +85,6 @@ void _configure_wifi_station(char* ssid, char* password)
     ESP_LOGI(TAG, "Configuring the station...");
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = ssid,
-            .password = password,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
             .pmf_cfg = {
                 .capable = true,
@@ -48,6 +92,19 @@ void _configure_wifi_station(char* ssid, char* password)
             },
         },
     };
+
+    int i=0;
+    while(ssid[i]) {
+        wifi_config.sta.ssid[i] = ssid[i];
+        i++;
+    }
+    
+    i=0;
+    while(password[i]) {
+        wifi_config.sta.password[i] = password[i];
+        i++;
+    }
+   
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_LOGI(TAG, "Station config complete");
@@ -79,7 +136,7 @@ int8_t _start_wifi()
     return status;
 }
 
-bool wifi_scan()
+wifi_scan_result wifi_scan()
 {
     _init_wifi_driver();
     wifi_country_t country_config = {
@@ -122,21 +179,47 @@ bool wifi_scan()
         portMAX_DELAY
     );
 
-    bool rval = SCAN_FAILURE;
+    wifi_scan_result rval;
     if (bits & SCAN_SUCCESS) {
-        rval = SCAN_SUCCESS;
+        rval.status = SCAN_SUCCESS;
+        esp_wifi_scan_get_ap_num(&rval.ap_count);
+        rval.access_points = (wifi_ap_record_t*)malloc(sizeof(wifi_ap_record_t) * rval.ap_count);
+        esp_wifi_scan_get_ap_records(&rval.ap_count, rval.access_points);
         ESP_LOGI(TAG, "Scan completed successfully!");
     } else if (bits & SCAN_FAILURE) {
-        rval = SCAN_FAILURE;
+        rval.status = SCAN_FAILURE;
         ESP_LOGI(TAG, "Scan failed misarebly :(");
     } else {
-        rval = SCAN_FAILURE;
+        rval.status = SCAN_FAILURE;
         ESP_LOGI(TAG, "Unexpected behaviour");
     }
 
     ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT,WIFI_EVENT_SCAN_DONE, wifi_handler_event_instance));
     vEventGroupDelete(wifi_event_group);
     return rval;
+}
+
+void wifi_print_scan_result(wifi_scan_result  res)
+{
+    for (size_t i = 0; i < res.ap_count; i++) {
+        char* country = malloc(sizeof(char)*3);
+        country[0] = res.access_points[i].country.cc[0];
+        country[1] = res.access_points[i].country.cc[1];
+        country[2] = 0;
+        ESP_LOGI(
+            TAG, 
+            "[%s] SSID: %s Channel: %d MAC: %xh-%xh-%xh-%xh-%xh-%xh",
+            country,
+            res.access_points[i].ssid,
+            res.access_points[i].primary,
+            res.access_points[i].bssid[0],
+            res.access_points[i].bssid[1],
+            res.access_points[i].bssid[2],
+            res.access_points[i].bssid[3],
+            res.access_points[i].bssid[4],
+            res.access_points[i].bssid[5]
+        );
+    }
 }
 
 void _register_event_handlers()
@@ -207,42 +290,20 @@ void _wifi_scan_event_handler(void* arg, esp_event_base_t event_base, int32_t ev
     xEventGroupSetBits(wifi_event_group,SCAN_SUCCESS);
     
     uint16_t ap_num = 0;
-    wifi_ap_record_t* ap_records = 0;
 
     esp_wifi_scan_get_ap_num(&ap_num);
     if (ap_num == 0) {
         ESP_LOGI(TAG, "No AP's Found");
-    } else {
-        ap_records = (wifi_ap_record_t*)malloc(sizeof(wifi_ap_record_t) * ap_num);
-        esp_wifi_scan_get_ap_records(&ap_num, ap_records);
     }
-    ESP_LOGI(TAG, "----- AP's Found: -----");
-    for (size_t i = 0; i < ap_num; i++) {
-        char* country = malloc(sizeof(char)*3);
-        country[0] = ap_records[i].country.cc[0];
-        country[1] = ap_records[i].country.cc[1];
-        country[2] = 0;
-        ESP_LOGI(
-            TAG, 
-            "[%s] SSID: %s Channel: %d MAC: %xh-%xh-%xh-%xh-%xh-%xh",
-            country,
-            ap_records[i].ssid,
-            ap_records[i].primary,
-            ap_records[i].bssid[0],
-            ap_records[i].bssid[1],
-            ap_records[i].bssid[2],
-            ap_records[i].bssid[3],
-            ap_records[i].bssid[4],
-            ap_records[i].bssid[5]
-
-        );
-    }
-    
-
    } else {
     xEventGroupSetBits(wifi_event_group,SCAN_FAILURE);
     ESP_LOGI(TAG, "Scan failed");
 
    }
 
+}
+
+void _wifi_send_deauth_packet(MacAddress target, MacAddress ap, int8_t channel)
+{   
+    esp_wifi_set_channel(channel,channel);
 }
